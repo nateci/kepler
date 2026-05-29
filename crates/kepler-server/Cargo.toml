@@ -1,0 +1,23 @@
+[package]
+name = "kepler-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kepler-server"
+path = "src/main.rs"
+
+[dependencies]
+kepler-types = { workspace = true }
+kepler-proto = { workspace = true }
+kepler-storage = { workspace = true }
+kepler-raft = { workspace = true }
+kepler-mvcc = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }

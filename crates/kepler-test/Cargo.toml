@@ -1,0 +1,16 @@
+[package]
+name = "kepler-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kepler-types = { workspace = true }
+kepler-storage = { workspace = true }
+kepler-raft = { workspace = true }
+kepler-mvcc = { workspace = true }
+kepler-client = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }

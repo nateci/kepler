@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kepler-types",
+    "crates/kepler-proto",
+    "crates/kepler-storage",
+    "crates/kepler-raft",
+    "crates/kepler-mvcc",
+    "crates/kepler-server",
+    "crates/kepler-client",
+    "crates/kepler-test",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Nate Cirino"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nateci/kepler"
+
+[workspace.dependencies]
+kepler-types = { path = "crates/kepler-types" }
+kepler-proto = { path = "crates/kepler-proto" }
+kepler-storage = { path = "crates/kepler-storage" }
+kepler-raft = { path = "crates/kepler-raft" }
+kepler-mvcc = { path = "crates/kepler-mvcc" }
+kepler-client = { path = "crates/kepler-client" }
+
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+bytes = "1"
+thiserror = "1"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+crossbeam-skiplist = "0.1"
+futures = "0.3"
+crc32fast = "1"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1

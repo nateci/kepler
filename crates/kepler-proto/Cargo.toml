@@ -1,0 +1,15 @@
+[package]
+name = "kepler-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kepler-types = { workspace = true }
+bytes = { workspace = true }
+
+# When wiring up tonic later, add:
+#   tonic        = "0.12"
+#   prost        = "0.13"
+#   tonic-build  = { version = "0.12", optional = true }
+# and a build.rs that compiles proto/kepler.proto.

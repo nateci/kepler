@@ -1,0 +1,13 @@
+[package]
+name = "kepler-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kepler-types = { workspace = true }
+kepler-proto = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }

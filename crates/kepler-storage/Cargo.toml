@@ -1,0 +1,16 @@
+[package]
+name = "kepler-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kepler-types = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+crc32fast = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

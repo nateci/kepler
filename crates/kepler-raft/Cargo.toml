@@ -1,0 +1,11 @@
+[package]
+name = "kepler-raft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kepler-types = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
