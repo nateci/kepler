@@ -8,12 +8,14 @@
 //! Read sections 5 and 6 of the Raft paper (Ongaro & Ousterhout, 2014) before
 //! implementing. Section 5.4 (safety) deserves three reads.
 
+pub mod mem_storage;
 pub mod node;
 pub mod storage;
 pub mod state_machine;
 pub mod types;
 
-pub use node::{Config, Node, Ready};
+pub use mem_storage::MemRaftStorage;
+pub use node::{Config, Node, Ready, Role};
 pub use state_machine::StateMachine;
 pub use storage::RaftStorage;
-pub use types::{ConfState, Entry, HardState, Message, MessageBody, Snapshot};
+pub use types::{ConfState, Entry, EntryKind, HardState, Message, MessageBody, Snapshot};

@@ -29,6 +29,7 @@
 pub mod memtable;
 pub mod sstable;
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use kepler_types::{Error, Key, KeyRange, Result, Value};
 
@@ -50,6 +51,8 @@ use self::sstable::{SsTable, SsTableWriter};
 pub struct LsmConfig {
     pub dir: PathBuf,
     pub memtable_max_bytes: usize,
+    /// Auto-compact when the number of SSTs reaches this threshold.
+    pub sst_compact_threshold: usize,
     pub wal: WalConfig,
 }
 
@@ -57,7 +60,12 @@ impl LsmConfig {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         let wal = WalConfig::new(dir.join("wal"));
-        Self { memtable_max_bytes: 4 * 1024 * 1024, wal, dir }
+        Self {
+            memtable_max_bytes: 4 * 1024 * 1024,
+            sst_compact_threshold: 4,
+            wal,
+            dir,
+        }
     }
 }
 
@@ -65,10 +73,18 @@ pub struct LsmEngine {
     config: LsmConfig,
     wal: Arc<DiskWal>,
     memtable: Mutex<MemTable>,
-    /// Newest first. Reads check `[0]`, `[1]`, ...
+    /// Sorted by `max_seq` descending. Reads check `[0]`, `[1]`, ...
+    /// `max_seq` reflects *content* age, not file age — compaction can produce
+    /// a newly-written file whose content is older than a concurrent flush.
     sstables: RwLock<Vec<Arc<SsTable>>>,
     next_gen: AtomicU64,
     next_seq: AtomicU64,
+    /// SSTs removed from the active set but still referenced by outstanding
+    /// snapshots. Files deleted lazily once the only remaining strong
+    /// reference is this list itself.
+    pending_delete: Mutex<Vec<Arc<SsTable>>>,
+    /// Serializes compactions so only one runs at a time.
+    compaction_lock: Mutex<()>,
 }
 
 impl LsmEngine {
@@ -76,15 +92,13 @@ impl LsmEngine {
         fs::create_dir_all(&config.dir)?;
         let wal = Arc::new(DiskWal::open(config.wal.clone())?);
 
-        let mut sst_paths: Vec<(u64, PathBuf)> = fs::read_dir(&config.dir)?
+        let sst_paths: Vec<(u64, PathBuf)> = fs::read_dir(&config.dir)?
             .filter_map(|e| e.ok())
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
                 parse_sst_gen(&name).map(|g| (g, e.path()))
             })
             .collect();
-        // Newest first.
-        sst_paths.sort_by(|a, b| b.0.cmp(&a.0));
 
         let mut sstables: Vec<Arc<SsTable>> = Vec::with_capacity(sst_paths.len());
         let mut max_sst_seq = 0u64;
@@ -95,6 +109,8 @@ impl LsmEngine {
             max_gen = max_gen.max(gen);
             sstables.push(sst);
         }
+        // Sort by content age, not file age.
+        sstables.sort_by(|a, b| b.max_seq().cmp(&a.max_seq()));
 
         // Replay any unflushed WAL entries into a fresh memtable.
         let mut memtable = MemTable::new();
@@ -117,6 +133,8 @@ impl LsmEngine {
             sstables: RwLock::new(sstables),
             next_gen: AtomicU64::new(next_gen),
             next_seq: AtomicU64::new(next_seq),
+            pending_delete: Mutex::new(Vec::new()),
+            compaction_lock: Mutex::new(()),
         })
     }
 
@@ -139,7 +157,7 @@ impl LsmEngine {
 
         {
             let mut ssts = self.sstables.write();
-            ssts.insert(0, sst); // newest first
+            insert_sst_sorted(&mut ssts, sst);
         }
 
         // Replace the in-memory memtable with an empty one.
@@ -152,6 +170,117 @@ impl LsmEngine {
         debug!(gen, max_seq, "flushed memtable to sst");
         Ok(())
     }
+
+    /// Merge every active SST into a single new SST, dropping shadowed values
+    /// and tombstones. v0 strategy: full compaction. Future work is tiered or
+    /// leveled with partial compactions; the public API can stay the same.
+    pub fn compact(&self) -> Result<()> {
+        let _guard = self.compaction_lock.lock();
+
+        let inputs: Vec<Arc<SsTable>> = {
+            let ssts = self.sstables.read();
+            if ssts.len() < 2 {
+                // Still useful to drop pending SSTs whose snapshot holders
+                // have since released them.
+                drop(ssts);
+                self.gc_pending_delete();
+                return Ok(());
+            }
+            ssts.clone()
+        };
+
+        let merged_max_seq = inputs.iter().map(|s| s.max_seq()).max().unwrap_or(0);
+
+        // Merge: newest source first; `or_insert` keeps the newest write per key.
+        use std::collections::BTreeMap;
+        let mut merged: BTreeMap<Key, Option<Value>> = BTreeMap::new();
+        for sst in inputs.iter() {
+            for (k, v) in sst.iter_all()? {
+                merged.entry(k).or_insert(v);
+            }
+        }
+
+        // Full compaction means there's no older data left to shadow, so
+        // tombstones can be dropped entirely.
+        let kept: Vec<(Key, Option<Value>)> = merged
+            .into_iter()
+            .filter(|(_, v)| v.is_some())
+            .collect();
+
+        let new_gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
+        let new_sst = if kept.is_empty() {
+            None
+        } else {
+            let new_path = self.config.dir.join(format!("sst-{:020}.sst", new_gen));
+            let iter = kept.iter().map(|(k, v)| (k, v));
+            SsTableWriter::write(&new_path, iter, merged_max_seq)?;
+            Some(Arc::new(SsTable::open(&new_path, new_gen)?))
+        };
+
+        // Atomic swap: remove inputs, insert merged output by max_seq position.
+        let input_gens: HashSet<u64> = inputs.iter().map(|s| s.generation()).collect();
+        {
+            let mut ssts = self.sstables.write();
+            ssts.retain(|s| !input_gens.contains(&s.generation()));
+            if let Some(sst) = new_sst.clone() {
+                insert_sst_sorted(&mut ssts, sst);
+            }
+        }
+
+        {
+            let mut pending = self.pending_delete.lock();
+            pending.extend(inputs);
+        }
+        self.gc_pending_delete();
+
+        debug!(new_gen, merged_max_seq, "compaction complete");
+        Ok(())
+    }
+
+    /// Trigger compaction if the active SST count is at or above the
+    /// configured threshold. Called automatically after flushes.
+    fn maybe_compact_if_threshold(&self) -> Result<()> {
+        let over = self.sstables.read().len() >= self.config.sst_compact_threshold;
+        if over {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Delete SSTs from `pending_delete` whose only remaining reference is
+    /// this list — i.e., no outstanding snapshot is still using them.
+    fn gc_pending_delete(&self) {
+        let mut pending = self.pending_delete.lock();
+        let mut keep = Vec::with_capacity(pending.len());
+        for sst in pending.drain(..) {
+            if Arc::strong_count(&sst) == 1 {
+                if let Err(e) = fs::remove_file(sst.path()) {
+                    warn!(error = ?e, path = ?sst.path(), "failed to delete compacted SST");
+                }
+                // sst drops here, count goes to 0, SsTable is freed
+            } else {
+                keep.push(sst);
+            }
+        }
+        *pending = keep;
+    }
+
+    /// Number of SSTs currently in `pending_delete`. Tests use this.
+    #[cfg(test)]
+    fn pending_delete_len(&self) -> usize {
+        self.pending_delete.lock().len()
+    }
+
+    /// Number of active SSTs.
+    #[cfg(test)]
+    fn active_sst_count(&self) -> usize {
+        self.sstables.read().len()
+    }
+}
+
+fn insert_sst_sorted(ssts: &mut Vec<Arc<SsTable>>, new_sst: Arc<SsTable>) {
+    let pos = ssts.partition_point(|s| s.max_seq() > new_sst.max_seq());
+    ssts.insert(pos, new_sst);
 }
 
 impl Engine for LsmEngine {
@@ -178,10 +307,18 @@ impl Engine for LsmEngine {
         let payload = encode_put_payload(&key, &value);
         self.wal.append(WalEntry { seq, kind: WalEntryKind::Put, payload })?;
 
-        let mut mt = self.memtable.lock();
-        mt.insert(seq, key, Some(value));
-        if mt.size() >= self.config.memtable_max_bytes {
-            self.flush_locked(&mut mt)?;
+        let did_flush = {
+            let mut mt = self.memtable.lock();
+            mt.insert(seq, key, Some(value));
+            if mt.size() >= self.config.memtable_max_bytes {
+                self.flush_locked(&mut mt)?;
+                true
+            } else {
+                false
+            }
+        };
+        if did_flush {
+            self.maybe_compact_if_threshold()?;
         }
         Ok(())
     }
@@ -191,10 +328,18 @@ impl Engine for LsmEngine {
         let payload = encode_delete_payload(key);
         self.wal.append(WalEntry { seq, kind: WalEntryKind::Delete, payload })?;
 
-        let mut mt = self.memtable.lock();
-        mt.insert(seq, Bytes::copy_from_slice(key), None);
-        if mt.size() >= self.config.memtable_max_bytes {
-            self.flush_locked(&mut mt)?;
+        let did_flush = {
+            let mut mt = self.memtable.lock();
+            mt.insert(seq, Bytes::copy_from_slice(key), None);
+            if mt.size() >= self.config.memtable_max_bytes {
+                self.flush_locked(&mut mt)?;
+                true
+            } else {
+                false
+            }
+        };
+        if did_flush {
+            self.maybe_compact_if_threshold()?;
         }
         Ok(())
     }
@@ -248,8 +393,12 @@ impl Engine for LsmEngine {
     }
 
     fn flush(&self) -> Result<()> {
-        let mut mt = self.memtable.lock();
-        self.flush_locked(&mut mt)
+        {
+            let mut mt = self.memtable.lock();
+            self.flush_locked(&mut mt)?;
+        }
+        self.maybe_compact_if_threshold()?;
+        Ok(())
     }
 }
 
@@ -356,6 +505,20 @@ mod tests {
         LsmConfig {
             dir: dir.to_path_buf(),
             memtable_max_bytes: 200, // tiny so flushes happen
+            sst_compact_threshold: 100, // high so it doesn't trigger in flush tests
+            wal: WalConfig {
+                dir: dir.join("wal"),
+                max_segment_bytes: 4096,
+                sync_on_append: true,
+            },
+        }
+    }
+
+    fn compact_config(dir: &Path, threshold: usize) -> LsmConfig {
+        LsmConfig {
+            dir: dir.to_path_buf(),
+            memtable_max_bytes: 200,
+            sst_compact_threshold: threshold,
             wal: WalConfig {
                 dir: dir.join("wal"),
                 max_segment_bytes: 4096,
@@ -524,5 +687,168 @@ mod tests {
         lsm.put(b("k"), b("v2")).unwrap();
         assert_eq!(snap.get(b"k").unwrap(), Some(b("v1")));
         assert_eq!(lsm.get(b"k").unwrap(), Some(b("v2")));
+    }
+
+    // ---- compaction ----
+
+    #[test]
+    fn compact_merges_two_ssts() {
+        let tmp = TempDir::new().unwrap();
+        let lsm = LsmEngine::open(small_config(tmp.path())).unwrap();
+        lsm.put(b("a"), b("1")).unwrap();
+        lsm.flush().unwrap();
+        lsm.put(b("b"), b("2")).unwrap();
+        lsm.flush().unwrap();
+        assert_eq!(sst_files(tmp.path()).len(), 2);
+
+        lsm.compact().unwrap();
+
+        assert_eq!(lsm.active_sst_count(), 1);
+        assert_eq!(sst_files(tmp.path()).len(), 1);
+        assert_eq!(lsm.get(b"a").unwrap(), Some(b("1")));
+        assert_eq!(lsm.get(b"b").unwrap(), Some(b("2")));
+    }
+
+    #[test]
+    fn compact_keeps_newest_value_per_key() {
+        let tmp = TempDir::new().unwrap();
+        let lsm = LsmEngine::open(small_config(tmp.path())).unwrap();
+        lsm.put(b("k"), b("v1")).unwrap();
+        lsm.flush().unwrap();
+        lsm.put(b("k"), b("v2")).unwrap();
+        lsm.flush().unwrap();
+        lsm.put(b("k"), b("v3")).unwrap();
+        lsm.flush().unwrap();
+
+        lsm.compact().unwrap();
+        assert_eq!(lsm.get(b"k").unwrap(), Some(b("v3")));
+        assert_eq!(lsm.active_sst_count(), 1);
+    }
+
+    #[test]
+    fn compact_drops_tombstones() {
+        let tmp = TempDir::new().unwrap();
+        let lsm = LsmEngine::open(small_config(tmp.path())).unwrap();
+        lsm.put(b("survives"), b("yes")).unwrap();
+        lsm.put(b("k"), b("v")).unwrap();
+        lsm.flush().unwrap();
+        lsm.delete(b"k").unwrap();
+        lsm.flush().unwrap();
+        assert_eq!(lsm.get(b"k").unwrap(), None);
+
+        lsm.compact().unwrap();
+        assert_eq!(lsm.get(b"k").unwrap(), None);
+        assert_eq!(lsm.get(b"survives").unwrap(), Some(b("yes")));
+
+        // After full compaction the merged SST should hold `survives` but no
+        // record (value or tombstone) for `k`.
+        let ssts = lsm.sstables.read();
+        assert_eq!(ssts.len(), 1);
+        let entries = ssts[0].iter_all().unwrap();
+        assert!(entries.iter().all(|(k, _)| k.as_ref() != b"k"));
+        assert!(entries.iter().any(|(k, v)| k.as_ref() == b"survives" && v.is_some()));
+    }
+
+    #[test]
+    fn compact_below_two_ssts_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let lsm = LsmEngine::open(small_config(tmp.path())).unwrap();
+        lsm.put(b("k"), b("v")).unwrap();
+        lsm.flush().unwrap();
+        let gen_before = lsm.sstables.read()[0].generation();
+
+        lsm.compact().unwrap();
+
+        let ssts = lsm.sstables.read();
+        assert_eq!(ssts.len(), 1);
+        assert_eq!(ssts[0].generation(), gen_before, "no new SST should be written");
+    }
+
+    #[test]
+    fn compaction_all_tombstones_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let lsm = LsmEngine::open(small_config(tmp.path())).unwrap();
+        lsm.put(b("a"), b("1")).unwrap();
+        lsm.flush().unwrap();
+        lsm.delete(b"a").unwrap();
+        lsm.flush().unwrap();
+
+        lsm.compact().unwrap();
+        // Both SSTs replaced by nothing (all tombstones cancel all values).
+        assert_eq!(lsm.active_sst_count(), 0);
+        assert_eq!(lsm.get(b"a").unwrap(), None);
+    }
+
+    #[test]
+    fn auto_compact_triggers_at_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let lsm = LsmEngine::open(compact_config(tmp.path(), 3)).unwrap();
+        let big = vec![0u8; 100];
+        // Each ~100B value with a small memtable threshold forces frequent flushes.
+        for i in 0..20 {
+            lsm.put(b(&format!("k{:03}", i)), Bytes::copy_from_slice(&big))
+                .unwrap();
+        }
+        // Below or at threshold by construction: after enough flushes the
+        // engine should have auto-compacted at least once.
+        assert!(
+            lsm.active_sst_count() < 20,
+            "expected auto-compaction; active SST count is {}",
+            lsm.active_sst_count()
+        );
+        // All keys still readable
+        for i in 0..20 {
+            assert!(lsm.get(format!("k{:03}", i).as_bytes()).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn snapshot_outliving_compaction_keeps_reading_old_data() {
+        let tmp = TempDir::new().unwrap();
+        let lsm = LsmEngine::open(small_config(tmp.path())).unwrap();
+        lsm.put(b("k"), b("v1")).unwrap();
+        lsm.flush().unwrap();
+
+        let snap = lsm.snapshot();
+
+        lsm.put(b("k"), b("v2")).unwrap();
+        lsm.flush().unwrap();
+        lsm.compact().unwrap();
+
+        // Engine sees the new value.
+        assert_eq!(lsm.get(b"k").unwrap(), Some(b("v2")));
+        // Snapshot still sees its frozen view.
+        assert_eq!(snap.get(b"k").unwrap(), Some(b("v1")));
+
+        // The old SST file should still be on disk because the snapshot holds it.
+        assert!(lsm.pending_delete_len() >= 1);
+
+        // After dropping the snapshot, the next compaction-triggered GC should
+        // reclaim the file. (We simulate by calling compact again — it'll be
+        // a no-op for content but will run gc.)
+        drop(snap);
+        lsm.compact().unwrap(); // no-op on content; runs gc
+        // pending should now be empty (count was 1, file deleted)
+        assert_eq!(lsm.pending_delete_len(), 0);
+    }
+
+    #[test]
+    fn compaction_survives_reopen() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let lsm = LsmEngine::open(small_config(tmp.path())).unwrap();
+            for i in 0..5 {
+                lsm.put(b(&format!("k{}", i)), b("v")).unwrap();
+                lsm.flush().unwrap();
+            }
+            lsm.compact().unwrap();
+        }
+        let lsm = LsmEngine::open(small_config(tmp.path())).unwrap();
+        for i in 0..5 {
+            assert_eq!(lsm.get(format!("k{}", i).as_bytes()).unwrap(), Some(b("v")));
+        }
+        // After compaction there should be exactly one SST on disk and
+        // reopening should see exactly one.
+        assert_eq!(lsm.active_sst_count(), 1);
     }
 }

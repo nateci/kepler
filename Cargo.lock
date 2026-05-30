@@ -266,6 +266,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "kepler-types",
+ "parking_lot",
  "thiserror",
  "tracing",
 ]

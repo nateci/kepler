@@ -43,7 +43,6 @@ const SST_MAGIC: u64 = 0xCAFE_F00D_DEAD_BEEF;
 
 pub struct SsTable {
     path: PathBuf,
-    #[allow(dead_code)]
     generation: u64,
     /// `(key, file_offset)` pairs, sorted by key.
     index: Vec<(Bytes, u64)>,
@@ -104,6 +103,24 @@ impl SsTable {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Read every record in key order. Used by the compactor.
+    pub fn iter_all(&self) -> Result<Vec<(Key, Option<Value>)>> {
+        if self.index.is_empty() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&self.path)?;
+        let mut reader = BufReader::new(file);
+        let mut out = Vec::with_capacity(self.index.len());
+        for _ in 0..self.index.len() {
+            out.push(read_record(&mut reader)?);
+        }
+        Ok(out)
     }
 
     /// Look up `key`.
