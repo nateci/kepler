@@ -178,8 +178,15 @@ impl Node {
         };
         self.storage.append(&[entry])?;
         self.match_index.insert(self.id, new_idx);
+
+        // Eagerly replicate to followers (minimizes proposal latency vs.
+        // waiting for the next heartbeat).
+        let peers: Vec<NodeId> = self.config.peers.clone();
+        for peer in peers {
+            self.send_append_entries(peer);
+        }
+
         self.maybe_advance_commit()?;
-        // Multi-node TODO: queue AppendEntries to followers with the new entry.
         Ok(())
     }
 
@@ -333,6 +340,9 @@ impl Node {
         }
 
         debug!(id = self.id, term = self.current_term, "became leader");
+        // Establish authority with an immediate heartbeat (carries current
+        // log state so followers can catch up).
+        self.broadcast_heartbeat();
         // For single-node, attempt to commit any pre-existing entries from
         // the new term right away. (For pre-existing entries from earlier
         // terms, the paper requires a current-term entry first — we skip
@@ -385,27 +395,42 @@ impl Node {
     }
 
     fn broadcast_heartbeat(&mut self) {
-        // Multi-node TODO: send per-peer AppendEntries with that peer's missing
-        // entries and a window from next_index. For v0 we send empty heartbeats.
-        let prev_log_index = self.storage.last_index().unwrap_or(0);
+        let peers: Vec<NodeId> = self.config.peers.clone();
+        for peer in peers {
+            self.send_append_entries(peer);
+        }
+    }
+
+    /// Build and queue an `AppendEntries` to `peer` based on the leader's
+    /// per-peer `next_index`. If the peer is fully caught up, this is an
+    /// empty heartbeat.
+    fn send_append_entries(&mut self, peer: NodeId) {
+        let next = *self.next_index.get(&peer).unwrap_or(&1);
+        let prev_log_index = next.saturating_sub(1);
         let prev_log_term = if prev_log_index == 0 {
             0
         } else {
             self.storage.term(prev_log_index).unwrap_or(0)
         };
-        for &peer in &self.config.peers {
-            self.pending_messages.push(Message {
-                from: self.id,
-                to: peer,
-                term: self.current_term,
-                body: MessageBody::AppendEntries {
-                    prev_log_index,
-                    prev_log_term,
-                    entries: Vec::new(),
-                    leader_commit: self.commit_index,
-                },
-            });
-        }
+        let last_idx = self.storage.last_index().unwrap_or(0);
+        let entries = if next > last_idx {
+            Vec::new()
+        } else {
+            let high_excl =
+                (next + self.config.max_entries_per_msg as u64).min(last_idx + 1);
+            self.storage.entries(next, high_excl).unwrap_or_default()
+        };
+        self.pending_messages.push(Message {
+            from: self.id,
+            to: peer,
+            term: self.current_term,
+            body: MessageBody::AppendEntries {
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit: self.commit_index,
+            },
+        });
     }
 
     fn handle_append_entries(
@@ -478,10 +503,13 @@ impl Node {
             self.match_index.insert(peer, match_index);
             self.next_index.insert(peer, match_index + 1);
             self.maybe_advance_commit()?;
-        } else if let Some(ni) = self.next_index.get_mut(&peer) {
-            // Step back and retry on next heartbeat. Real impls do bin-search
-            // back-off via the "conflict info" returned by the follower.
-            *ni = (*ni).saturating_sub(1).max(1);
+        } else {
+            // Step back and retry immediately (eager retry; real impls do
+            // bin-search back-off via "conflict info" returned by the follower).
+            if let Some(ni) = self.next_index.get_mut(&peer) {
+                *ni = (*ni).saturating_sub(1).max(1);
+            }
+            self.send_append_entries(peer);
         }
         Ok(())
     }
